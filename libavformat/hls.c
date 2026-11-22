@@ -1952,8 +1952,13 @@ static int read_data_continuous(void *opaque, uint8_t *buf, int buf_size)
     int segment_retries = 0;
     struct segment *seg;
 
+    /* The kept connection is gone after a failed request on it or after
+     * the init section was read through it; the flag must not outlive it. */
+    if (!v->input)
+        v->input_read_done = 0;
+
     if (c->http_persistent && v->input_read_done) {
-        av_assert0(v->input);
+        /* A previous I/O error may have closed the input. */
         ret = reload_playlist(v, c);
         if (ret < 0)
             return ret;
