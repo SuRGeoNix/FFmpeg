@@ -32,7 +32,10 @@
 #include "tls.h"
 
 #define SECURITY_WIN32
+#define SCHANNEL_USE_BLACKLISTS
 #include <windows.h>
+#include <winternl.h>
+#include <schannel.h>
 #include <security.h>
 #include <schnlsp.h>
 #include <sddl.h>
@@ -619,6 +622,8 @@ typedef struct TLSContext {
     int connected;
     int connection_closed;
     int sspi_close_notify;
+    int enc_buf_incomplete;
+    int is_tls13;
 
     int have_private_cert;
 } TLSContext;
@@ -848,6 +853,19 @@ static int tls_handshake_loop(URLContext *h, int initial)
     }
 
     uc->flags &= ~AVIO_FLAG_NONBLOCK;
+
+    /* Pending application records must precede post-handshake output. */
+    if (!initial && c->is_tls13) {
+        while (c->send_buf) {
+            int previous_offset = c->send_buf_offset;
+
+            ret = tls_process_send_buffer(h);
+            if (ret == AVERROR(EAGAIN) && c->send_buf_offset > previous_offset)
+                continue;
+            if (ret < 0)
+                goto fail;
+        }
+    }
 
     while (1) {
         if (c->enc_buf_size - c->enc_buf_offset < SCHANNEL_FREE_BUFFER_SIZE) {
@@ -1108,10 +1126,45 @@ static int tls_handshake(URLContext *h)
 #endif
 
     c->connected = 1;
+#if defined(SP_PROT_TLS1_3) || (defined(SP_PROT_TLS1_3_CLIENT) && defined(SP_PROT_TLS1_3_SERVER))
+    {
+        SecPkgContext_ConnectionInfo conn_info;
+        sspi_ret = QueryContextAttributes(&c->ctxt_handle, SECPKG_ATTR_CONNECTION_INFO, &conn_info);
+        if (sspi_ret == SEC_E_OK) {
+#if defined(SP_PROT_TLS1_3)
+            c->is_tls13 = !!(conn_info.dwProtocol & SP_PROT_TLS1_3);
+#else
+            c->is_tls13 = !!(conn_info.dwProtocol & (SP_PROT_TLS1_3_CLIENT | SP_PROT_TLS1_3_SERVER));
+#endif
+        }
+    }
+#endif
 
 fail:
     return ret;
 }
+
+#if defined(SCH_CREDENTIALS_VERSION)
+static int schannel_supports_modern_credentials(void)
+{
+    typedef LONG (WINAPI *RtlGetVersionFunc)(OSVERSIONINFOW *);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    RtlGetVersionFunc get_version;
+    OSVERSIONINFOW version = { 0 };
+
+    if (!ntdll)
+        return 0;
+    get_version = (RtlGetVersionFunc)GetProcAddress(ntdll, "RtlGetVersion");
+    if (!get_version)
+        return 0;
+    version.dwOSVersionInfoSize = sizeof(version);
+    if (get_version(&version) < 0)
+        return 0;
+
+    return version.dwMajorVersion > 10 ||
+           (version.dwMajorVersion == 10 && version.dwBuildNumber >= 17763);
+}
+#endif
 
 static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **options)
 {
@@ -1119,6 +1172,10 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
     TLSShared *s = &c->tls_shared;
     SECURITY_STATUS sspi_ret;
     SCHANNEL_CRED schannel_cred = { 0 };
+#if defined(SCH_CREDENTIALS_VERSION)
+    SCH_CREDENTIALS modern_cred = { 0 };
+#endif
+    void *credentials = &schannel_cred;
     PCCERT_CONTEXT crtctx = NULL;
     NCRYPT_KEY_HANDLE key = 0;
     int ret = 0;
@@ -1176,10 +1233,20 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
 #endif
     }
 
+#if defined(SCH_CREDENTIALS_VERSION)
+    if (!s->is_dtls && schannel_supports_modern_credentials()) {
+        modern_cred.dwVersion = SCH_CREDENTIALS_VERSION;
+        modern_cred.cCreds = schannel_cred.cCreds;
+        modern_cred.paCred = schannel_cred.paCred;
+        modern_cred.dwFlags = schannel_cred.dwFlags;
+        credentials = &modern_cred;
+    }
+#endif
+
     /* Get credential handle */
     sspi_ret = AcquireCredentialsHandle(NULL, (TCHAR *)UNISP_NAME,
                                         s->listen ? SECPKG_CRED_INBOUND : SECPKG_CRED_OUTBOUND,
-                                        NULL, &schannel_cred, NULL, NULL, &c->cred_handle,
+                                        NULL, credentials, NULL, NULL, &c->cred_handle,
                                         &c->cred_timestamp);
     if (sspi_ret != SEC_E_OK) {
         av_log(h, AV_LOG_ERROR, "Unable to acquire security credentials (0x%lx)\n", sspi_ret);
@@ -1242,7 +1309,23 @@ static int tls_read(URLContext *h, uint8_t *buf, int len)
     if (c->sspi_close_notify)
         goto cleanup;
 
-    if (!c->connection_closed) {
+    if (c->is_tls13 && c->send_buf) {
+        uc->flags &= ~AVIO_FLAG_NONBLOCK;
+        uc->flags |= h->flags & AVIO_FLAG_NONBLOCK;
+        while (c->send_buf) {
+            int previous_offset = c->send_buf_offset;
+
+            ret = tls_process_send_buffer(h);
+            if (ret == AVERROR(EAGAIN) && c->send_buf_offset > previous_offset)
+                continue;
+            if (ret < 0)
+                return ret;
+        }
+    }
+
+    /* Process any complete buffered TLS 1.3 records before reading more. */
+    if (!c->connection_closed &&
+        (!c->is_tls13 || !c->enc_buf_offset || c->enc_buf_incomplete)) {
         size = c->enc_buf_size - c->enc_buf_offset;
         if (size < SCHANNEL_FREE_BUFFER_SIZE || c->enc_buf_size < min_enc_buf_size) {
             c->enc_buf_size = c->enc_buf_offset + SCHANNEL_FREE_BUFFER_SIZE;
@@ -1264,6 +1347,8 @@ static int tls_read(URLContext *h, uint8_t *buf, int len)
             c->connection_closed = 1;
             ret = 0;
         } else if (ret == AVERROR(EAGAIN)) {
+            if (c->enc_buf_incomplete)
+                return ret;
             ret = 0;
         } else if (ret < 0) {
             av_log(h, AV_LOG_ERROR, "Unable to read from socket\n");
@@ -1271,6 +1356,8 @@ static int tls_read(URLContext *h, uint8_t *buf, int len)
         }
 
         c->enc_buf_offset += ret;
+        if (ret > 0)
+            c->enc_buf_incomplete = 0;
     }
 
     while (c->enc_buf_offset > 0 && sspi_ret == SEC_E_OK) {
@@ -1286,6 +1373,7 @@ static int tls_read(URLContext *h, uint8_t *buf, int len)
         sspi_ret = DecryptMessage(&c->ctxt_handle, &inbuf_desc, 0, NULL);
         if (sspi_ret == SEC_E_OK || sspi_ret == SEC_I_RENEGOTIATE ||
             sspi_ret == SEC_I_CONTEXT_EXPIRED) {
+            c->enc_buf_incomplete = 0;
             /* handle decrypted data */
             if (inbuf[1].BufferType == SECBUFFER_DATA) {
                 /* grow buffer if needed */
@@ -1309,6 +1397,47 @@ static int tls_read(URLContext *h, uint8_t *buf, int len)
                     c->dec_buf_offset += size;
                 }
             }
+            if (sspi_ret == SEC_I_RENEGOTIATE && c->is_tls13) {
+                size_t token_size = c->enc_buf_offset;
+                const uint8_t *token_data = c->enc_buf;
+
+                if (inbuf[3].BufferType == SECBUFFER_EXTRA && inbuf[3].cbBuffer) {
+                    uintptr_t token_addr = (uintptr_t)inbuf[3].pvBuffer;
+                    uintptr_t buf_addr = (uintptr_t)c->enc_buf;
+
+                    token_size = inbuf[3].cbBuffer;
+                    if (!token_addr || token_size > c->enc_buf_offset ||
+                        token_addr < buf_addr ||
+                        token_addr - buf_addr != c->enc_buf_offset - token_size) {
+                        av_log(h, AV_LOG_ERROR, "Invalid TLS 1.3 post-handshake EXTRA buffer\n");
+                        ret = AVERROR(EIO);
+                        goto cleanup;
+                    }
+                    token_data = inbuf[3].pvBuffer;
+                } else {
+                    /* Schannel can return SEC_I_RENEGOTIATE without EXTRA.
+                     * Pass the input modified in place by DecryptMessage. */
+                    av_log(h, AV_LOG_TRACE,
+                           "TLS 1.3 post-handshake without EXTRA: input=%d bytes "
+                           "b0=%lu/%lu b1=%lu/%lu b2=%lu/%lu b3=%lu/%lu\n",
+                           c->enc_buf_offset,
+                           inbuf[0].BufferType, inbuf[0].cbBuffer,
+                           inbuf[1].BufferType, inbuf[1].cbBuffer,
+                           inbuf[2].BufferType, inbuf[2].cbBuffer,
+                           inbuf[3].BufferType, inbuf[3].cbBuffer);
+                }
+
+                memmove(c->enc_buf, token_data, token_size);
+                c->enc_buf_offset = token_size;
+                ret = tls_handshake_loop(h, 0);
+                if (ret < 0)
+                    goto cleanup;
+
+                /* Any further encrypted records remain in enc_buf for decryption. */
+                sspi_ret = SEC_E_OK;
+                continue;
+            }
+
             if (inbuf[3].BufferType == SECBUFFER_EXTRA && inbuf[3].cbBuffer > 0) {
                 if (c->enc_buf_offset > inbuf[3].cbBuffer) {
                     memmove(c->enc_buf, (c->enc_buf + c->enc_buf_offset) - inbuf[3].cbBuffer,
@@ -1347,6 +1476,7 @@ static int tls_read(URLContext *h, uint8_t *buf, int len)
                 goto cleanup;
             }
         } else if (sspi_ret == SEC_E_INCOMPLETE_MESSAGE) {
+            c->enc_buf_incomplete = 1;
             ret = AVERROR(EAGAIN);
             goto cleanup;
         } else {
